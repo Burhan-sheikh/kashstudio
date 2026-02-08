@@ -1,0 +1,206 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+    
+    // Helper functions
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+    
+    function isUser(userId) {
+      return isAuthenticated() && request.auth.uid == userId;
+    }
+    
+    function hasRole(role) {
+      return isAuthenticated() && 
+             get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == role;
+    }
+    
+    function isAdmin() {
+      return hasRole('admin');
+    }
+    
+    function isDeveloper() {
+      return hasRole('developer');
+    }
+    
+    function isClient() {
+      return hasRole('client');
+    }
+    
+    function isActiveUser() {
+      return isAuthenticated() && 
+             get(/databases/$(database)/documents/users/$(request.auth.uid)).data.isActive == true;
+    }
+    
+    function isDeveloperApproved(developerId) {
+      return exists(/databases/$(database)/documents/developers/$(developerId)) &&
+             get(/databases/$(database)/documents/developers/$(developerId)).data.status == 'approved';
+    }
+
+    // Users collection
+    match /users/{userId} {
+      // Anyone can read basic user info (for display purposes)
+      allow read: if isAuthenticated();
+      
+      // Users can create their own account
+      allow create: if isUser(userId) && 
+                      request.resource.data.keys().hasAll(['role', 'email', 'createdAt']) &&
+                      request.resource.data.role in ['developer', 'client'];
+      
+      // Users can update their own profile (except role and critical fields)
+      allow update: if isUser(userId) && 
+                      !request.resource.data.diff(resource.data).affectedKeys().hasAny(['role', 'emailVerified', 'createdAt']);
+      
+      // Only admin can delete or change roles
+      allow delete: if isAdmin();
+      allow update: if isAdmin();
+    }
+
+    // Developers collection
+    match /developers/{developerId} {
+      // Public read for approved developers
+      allow read: if resource.data.status == 'approved' || 
+                    isUser(developerId) || 
+                    isAdmin();
+      
+      // Developers can create their profile
+      allow create: if isUser(developerId) && 
+                      isDeveloper() &&
+                      request.resource.data.userId == request.auth.uid &&
+                      request.resource.data.status == 'pending';
+      
+      // Developers can update their own profile (limited fields)
+      allow update: if isUser(developerId) && 
+                      !request.resource.data.diff(resource.data).affectedKeys()
+                        .hasAny(['status', 'totalSales', 'totalRevenue', 'approvedAt']);
+      
+      // Admin can approve/reject/suspend
+      allow update: if isAdmin();
+      allow delete: if isAdmin();
+    }
+
+    // Clients collection
+    match /clients/{clientId} {
+      allow read: if isUser(clientId) || isAdmin();
+      allow create: if isUser(clientId) && isClient();
+      // totals updated by Cloud Functions only
+      allow update: if false;
+      allow delete: if isAdmin();
+    }
+
+    // Projects collection
+    match /projects/{projectId} {
+      // Public can read approved projects
+      allow read: if resource.data.status == 'approved' || 
+                    isUser(resource.data.developerId) || 
+                    isAdmin();
+      
+      // Developers can create projects
+      allow create: if isAuthenticated() && 
+                      isDeveloper() &&
+                      isDeveloperApproved(request.auth.uid) &&
+                      request.resource.data.developerId == request.auth.uid &&
+                      request.resource.data.status in ['draft', 'pending'];
+      
+      // Developers can update their own projects (limited fields)
+      allow update: if isUser(resource.data.developerId) && 
+                      !request.resource.data.diff(resource.data).affectedKeys()
+                        .hasAny(['developerId', 'totalSales', 'averageRating', 'totalReviews', 'approvedAt', 'soldAt']) &&
+                      resource.data.status != 'sold';
+      
+      // Admin can moderate
+      allow update: if isAdmin();
+      allow delete: if isAdmin();
+      
+      // Project versions subcollection
+      match /versions/{versionId} {
+        allow read: if isUser(get(/databases/$(database)/documents/projects/$(projectId)).data.developerId) || isAdmin();
+        allow create: if isUser(get(/databases/$(database)/documents/projects/$(projectId)).data.developerId);
+        allow update, delete: if false; // Immutable
+      }
+    }
+
+    // Orders collection (immutable financial records)
+    match /orders/{orderId} {
+      // Only involved parties and admin can read
+      allow read: if isUser(resource.data.clientId) || 
+                    isUser(resource.data.developerId) || 
+                    isAdmin();
+      
+      // Only Cloud Functions can create orders
+      allow create: if false;
+      
+      // Orders are immutable
+      allow update, delete: if false;
+    }
+
+    // Purchases collection
+    match /purchases/{purchaseId} {
+      // Only buyer and admin can read
+      allow read: if isUser(resource.data.clientId) || isAdmin();
+      
+      // Only Cloud Functions can create/update
+      allow create, update: if false;
+      allow delete: if isAdmin();
+    }
+
+    // Reviews collection
+    match /projectReviews/{reviewId} {
+      // Public can read approved reviews
+      allow read: if resource.data.status == 'approved' || 
+                    isUser(resource.data.clientId) || 
+                    isAdmin();
+      
+      // Clients can create reviews (verified by Cloud Function)
+      allow create: if isAuthenticated() && 
+                      isClient() &&
+                      request.resource.data.clientId == request.auth.uid &&
+                      request.resource.data.status == 'pending';
+      
+      // Clients can update their own pending reviews
+      allow update: if isUser(resource.data.clientId) && 
+                      resource.data.status == 'pending' &&
+                      !request.resource.data.diff(resource.data).affectedKeys()
+                        .hasAny(['clientId', 'projectId', 'developerId', 'createdAt']);
+      
+      // Admin can moderate
+      allow update: if isAdmin();
+      allow delete: if isAdmin();
+    }
+
+    // Legal acceptances
+    match /legalAcceptances/{id} {
+      allow read: if isUser(resource.data.userId) || isAdmin();
+      allow create: if isUser(request.resource.data.userId);
+      allow update, delete: if false; // Immutable
+    }
+
+    // Disputes
+    match /disputes/{id} {
+      allow read: if isUser(resource.data.clientId) || 
+                    isUser(resource.data.developerId) || 
+                    isAdmin();
+      allow create: if isAuthenticated() && 
+                      (isUser(request.resource.data.clientId) || isUser(request.resource.data.developerId));
+      allow update: if isAdmin();
+      allow delete: if isAdmin();
+    }
+
+    // Notifications
+    match /notifications/{id} {
+      allow read: if isUser(resource.data.userId);
+      allow create: if false; // Only Cloud Functions
+      allow update: if isUser(resource.data.userId) && 
+                      request.resource.data.diff(resource.data).affectedKeys().hasOnly(['read']);
+      allow delete: if isUser(resource.data.userId) || isAdmin();
+    }
+
+    // Platform settings (admin only)
+    match /settings/{document} {
+      allow read: if isAuthenticated();
+      allow write: if isAdmin();
+    }
+  }
+}

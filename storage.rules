@@ -1,0 +1,101 @@
+rules_version = '2';
+
+service firebase.storage {
+  match /b/{bucket}/o {
+    
+    // Helper functions
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+    
+    function isUser(userId) {
+      return isAuthenticated() && request.auth.uid == userId;
+    }
+    
+    function hasRole(role) {
+      return isAuthenticated() && 
+             firestore.get(/databases/(default)/documents/users/$(request.auth.uid)).data.role == role;
+    }
+    
+    function isAdmin() {
+      return hasRole('admin');
+    }
+    
+    function isDeveloper() {
+      return hasRole('developer');
+    }
+    
+    function isValidImageSize() {
+      return request.resource.size < 5 * 1024 * 1024; // 5MB
+    }
+    
+    function isValidZipSize() {
+      return request.resource.size < 100 * 1024 * 1024; // 100MB
+    }
+    
+    function isValidImageType() {
+      return request.resource.contentType.matches('image/.*');
+    }
+    
+    function isValidZipType() {
+      return request.resource.contentType == 'application/zip' || 
+             request.resource.contentType == 'application/x-zip-compressed';
+    }
+
+    // User profile images
+    match /users/{userId}/profile/{fileName} {
+      allow read: if isAuthenticated();
+      allow write: if isUser(userId) && 
+                     isValidImageSize() && 
+                     isValidImageType();
+      allow delete: if isUser(userId) || isAdmin();
+    }
+
+    // Developer documents (ID proof, etc.)
+    match /developers/{developerId}/documents/{fileName} {
+      allow read: if isUser(developerId) || isAdmin();
+      allow write: if isUser(developerId) && 
+                     isDeveloper() &&
+                     request.resource.size < 10 * 1024 * 1024; // 10MB
+      allow delete: if isAdmin();
+    }
+
+    // Project images (screenshots, logos)
+    match /projects/{projectId}/images/{fileName} {
+      allow read: if true; // Public read for approved projects
+      allow write: if isDeveloper() && 
+                     isValidImageSize() && 
+                     isValidImageType();
+      allow delete: if isDeveloper() || isAdmin();
+    }
+
+    // Project files (source code zips) - NO PUBLIC ACCESS
+    match /projects/{projectId}/versions/{versionId}/{fileName} {
+      // NO direct read access - must go through Cloud Function
+      allow read: if false;
+      
+      // Only developers can upload
+      allow write: if isDeveloper() && 
+                     isValidZipSize() && 
+                     isValidZipType();
+      
+      allow delete: if isAdmin();
+    }
+
+    // Invoice PDFs
+    match /invoices/{orderId}/{fileName} {
+      // NO direct read - must go through Cloud Function for authorization
+      allow read: if false;
+      allow write: if false; // Only Cloud Functions generate invoices
+      allow delete: if isAdmin();
+    }
+
+    // Dispute evidence
+    match /disputes/{disputeId}/evidence/{fileName} {
+      allow read: if isAdmin();
+      allow write: if isAuthenticated() && 
+                     request.resource.size < 10 * 1024 * 1024; // 10MB
+      allow delete: if isAdmin();
+    }
+  }
+}
